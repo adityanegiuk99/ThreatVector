@@ -1,0 +1,89 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-veylix}
+      POSTGRES_USER: ${POSTGRES_USER:-veylix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-veylix_dev_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./app/db/init.sql:/docker-entrypoint-initdb.d/10_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-veylix} -d ${POSTGRES_DB:-veylix}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-veylix}
+      POSTGRES_USER: ${POSTGRES_USER:-veylix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-veylix_dev_password}
+      VEYLIX_ENV: docker
+      VEYLIX_SECRET_KEY: ${VEYLIX_SECRET_KEY:-change-me-in-prod}
+      VEYLIX_SIGNING_KEY: ${VEYLIX_SIGNING_KEY:-change-me-in-prod}
+      LLM_PROVIDER: ${LLM_PROVIDER:-none}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+    ports:
+      - "${VEYLIX_API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.services.ingest_cisa &&
+             python -m app.services.ingest_nvd &&
+             python -m app.services.ingest_mitre &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-veylix}
+      POSTGRES_USER: ${POSTGRES_USER:-veylix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-veylix_dev_password}
+      VEYLIX_ENV: docker
+      VEYLIX_SECRET_KEY: change-me-in-prod
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "python -m app.services.ingest_cisa &&
+             python -m app.services.ingest_nvd &&
+             python -m app.services.ingest_mitre &&
+             python -m app.services.reindex"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  pgdata:

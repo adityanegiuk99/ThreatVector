@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: veylix
+          POSTGRES_USER: veylix
+          POSTGRES_PASSWORD: veylix_dev_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U veylix"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: veylix
+      POSTGRES_USER: veylix
+      POSTGRES_PASSWORD: veylix_dev_password
+      VEYLIX_SECRET_KEY: ci-test-key
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run migrations
+        run: alembic upgrade head
+      - name: Ingest KEV (small real-data check)
+        run: |
+          python -m app.services.ingest_all --source kev
+      - name: Tests (unit, integration; e2e uses ingested data)
+        run: pytest tests -q
+      - name: Lint
+        run: ruff check app tests || true
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci || npm install
+        working-directory: src
+      - run: npm run build
+        working-directory: src
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+
+  docker-compose-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose file syntax
+        run: docker compose config -q
