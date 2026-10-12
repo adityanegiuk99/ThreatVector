@@ -1,0 +1,68 @@
+name: scheduled-retrain
+
+# Day 4: periodic automated retraining with a validation gate.
+# The challenger is promoted only if it beats the incumbent's recorded
+# test PR-AUC by >= min_improvement (see app/services/ml/retrain.py).
+
+on:
+  schedule:
+    - cron: "0 4 * * 1" # Mondays 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      min_improvement:
+        description: "Minimum test PR-AUC improvement required to activate"
+        required: false
+        default: "0.01"
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: veylix_ci
+      POSTGRES_USER: veylix
+      POSTGRES_PASSWORD: veylix_ci_password
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: veylix_ci
+          POSTGRES_USER: veylix
+          POSTGRES_PASSWORD: veylix_ci_password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U veylix"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Migrate
+        run: alembic upgrade head
+      - name: Ingest fresh data
+        run: python -m app.services.ingest_all --source all --lookback-days 7
+      - name: Retrain with promotion gate
+        run: |
+          python -m app.services.ml.retrain \
+            --min-improvement "${{ inputs.min_improvement || '0.01' }}"
+      - name: Verify DB
+        if: always()
+        run: |
+          python - <<'PY'
+          from sqlalchemy import text
+          from app.db.session import engine
+          with engine.connect() as conn:
+              rows = conn.execute(text(
+                  "SELECT name, version, algorithm, is_active FROM model_versions "
+                  "ORDER BY trained_at DESC LIMIT 5")).fetchall()
+          for r in rows:
+              print(r)
+          PY
