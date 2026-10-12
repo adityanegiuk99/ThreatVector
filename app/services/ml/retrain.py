@@ -1,20 +1,18 @@
 """Day 4: Automated retraining pipeline with a validation gate.
 
-Flow (all steps recorded as a single RetrainRun row in retrain_runs):
-  1. Snapshot current active model's test PR-AUC as the incumbent baseline.
-  2. Rebuild the dataset from the current DB and train all candidates.
+Flow:
+  1. Read the current active model's test PR-AUC from evaluation_metrics
+     as the incumbent baseline (never a hand-copied number).
+  2. Rebuild the dataset from the current DB and train all candidates via
+     the existing leakage-safe pipeline (train.run_training).
   3. Gate: the challenger must beat the incumbent's test PR-AUC by at least
-     `min_improvement` (default 0.01) on the *same* metric — otherwise the
-     new version is registered but NOT activated (safe deploy semantics).
-  4. Optionally re-embed the retrieval index (off by default; the corpus
-     changes rarely).
+     `min_improvement` — otherwise the new versions are registered but NOT
+     activated (safe deploy semantics).
+  4. Optionally re-embed the retrieval index (--reindex).
 
-Design constraints honored:
-  - Never fabricate metrics: comparisons use the recorded test metrics of
-    both runs, computed from the same evaluation function.
-  - The incumbent metric is read from evaluation_metrics for the currently
-    active version (dataset_tag='test', metric_name='pr_auc'), not from a
-    hand-copied number.
+IDs and version strings are taken from run_training's own report
+(model_version_ids / selected), so this module can never drift from what
+train.py actually wrote.
 """
 from __future__ import annotations
 
@@ -27,7 +25,6 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 
 from app.core.logging_conf import configure_logging
-from app.db.models import EvaluationMetric
 
 logger = logging.getLogger("veylix.retrain")
 
@@ -38,6 +35,7 @@ class RetrainDecision:
     incumbent_pr_auc: float | None
     challenger_version: str
     challenger_pr_auc: float
+    challenger_model_version_id: int | None
     activated: bool
     reason: str
 
@@ -89,6 +87,9 @@ def run_retrain(
     min_improvement: float = 0.01,
     reindex: bool = False,
 ) -> RetrainDecision:
+    from sqlalchemy.orm import Session as _Session  # noqa: F401  (typing aid only)
+
+    from app.db.models import ModelVersion
     from app.services.ml.train import run_training
 
     run_started = datetime.now(timezone.utc)
@@ -97,24 +98,53 @@ def run_retrain(
     report = run_training(db, model_name=model_name, activate_best=False)
     challenger_version = report["version"]
     challenger_auc = float(report["results"][report["selected"]]["test"]["pr_auc"])
+    mv_id = (report.get("model_version_ids") or {}).get(report["selected"])
 
     activated, reason = should_activate(incumbent_auc, challenger_auc, min_improvement)
 
     if activated:
-        db.query(__import__("app.db.models", fromlist=["ModelVersion"]).ModelVersion).filter(
-            __import__("app.db.models", fromlist=["ModelVersion"]).ModelVersion.name == model_name
-        ).update({"is_active": False})
-        db.execute(
-            text("UPDATE model_versions SET is_active = true WHERE name = :n AND version = :v"),
-            {"n": model_name, "v": challenger_version},
-        )
+        if mv_id is None:
+            # Belt-and-braces: locate the exact candidate row by (name, version-alias).
+            row = db.execute(
+                text(
+                    "SELECT id FROM model_versions "
+                    "WHERE name = :n AND version = :v "
+                    "ORDER BY trained_at DESC LIMIT 1"
+                ),
+                {"n": model_name, "v": f"{challenger_version}-{report['selected']}"},
+            ).first()
+            mv_id = row[0] if row else None
+        if mv_id is None:
+            activated = False
+            reason = "could not locate challenger model_version row; nothing activated"
+        else:
+            # Deactivate only the same-name family, in one statement, then
+            # activate exactly the challenger row chosen above.
+            with db.begin_nested() as sp:
+                db.execute(
+                    text("UPDATE model_versions SET is_active = false WHERE name = :n"),
+                    {"n": model_name},
+                )
+                db.execute(
+                    text("UPDATE model_versions SET is_active = true WHERE id = :id"),
+                    {"id": mv_id},
+                )
+                sp.commit()
+
     db.commit()
+
+    if reindex:
+        from app.services.retrieval.embed import index_documents
+
+        counts = index_documents(db)
+        logger.info("reindex complete: %s", counts)
 
     decision = RetrainDecision(
         incumbent_version=incumbent_version,
         incumbent_pr_auc=incumbent_auc,
         challenger_version=challenger_version,
         challenger_pr_auc=challenger_auc,
+        challenger_model_version_id=mv_id,
         activated=activated,
         reason=reason,
     )
